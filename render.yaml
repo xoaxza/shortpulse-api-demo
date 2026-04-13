@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: shortpulse-api
+    env: python
+    buildCommand: python3 -m py_compile app.py shortpulse.py smoke_test.py
+    startCommand: python3 app.py
+    envVars:
+      - key: SHORTPULSE_DB_PATH
+        value: data/shortpulse.sqlite
