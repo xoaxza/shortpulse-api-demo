@@ -7,12 +7,12 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from app import ShortPulseApplication, create_server
-from shortpulse import ShortPulseService, UpstreamError
+from shortpulse import ShortPulseService
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "finra"
@@ -30,6 +30,17 @@ class FakeResponse:
 
     def read(self) -> bytes:
         return self.body
+
+
+class MutableClock:
+    def __init__(self, current: datetime) -> None:
+        self.current = current
+
+    def __call__(self) -> datetime:
+        return self.current
+
+    def advance(self, *, seconds: int = 0) -> None:
+        self.current += timedelta(seconds=seconds)
 
 
 class SmokeTest(unittest.TestCase):
@@ -63,7 +74,7 @@ class SmokeTest(unittest.TestCase):
         last_error: OSError | None = None
         for _ in range(20):
             try:
-                with urllib.request.urlopen(f"{cls.base_url}/", timeout=1) as response:
+                with urllib.request.urlopen(f"{cls.base_url}/healthz", timeout=1) as response:
                     response.read()
                 return
             except OSError as exc:
@@ -83,8 +94,19 @@ class SmokeTest(unittest.TestCase):
             data=data,
             headers=headers,
         )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            return response.status, response.headers.get("Content-Type", ""), response.read()
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return (
+                    response.status,
+                    response.headers.get("Content-Type", ""),
+                    response.read(),
+                )
+        except urllib.error.HTTPError as exc:
+            return (
+                exc.code,
+                exc.headers.get("Content-Type", ""),
+                exc.read(),
+            )
 
     def fetch_json(self, path: str) -> dict:
         status, content_type, body = self.request("GET", path)
@@ -98,6 +120,10 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("text/html", content_type)
         return body.decode("utf-8")
 
+    def fetch_text(self, path: str) -> tuple[int, str, str]:
+        status, content_type, body = self.request("GET", path)
+        return status, content_type, body.decode("utf-8")
+
     def post_json(self, path: str, payload: dict) -> dict:
         status, content_type, body = self.request("POST", path, payload=payload)
         self.assertEqual(status, 200, body.decode("utf-8"))
@@ -105,14 +131,28 @@ class SmokeTest(unittest.TestCase):
         return json.loads(body.decode("utf-8"))
 
     def test_smoke_endpoints(self) -> None:
+        health_status, health_content_type, health_body = self.fetch_text("/healthz")
+        self.assertEqual(health_status, 200)
+        self.assertIn("text/plain", health_content_type)
+        self.assertEqual(health_body, "ok\n")
+
         html = self.fetch_html("/")
         self.assertIn("ShortPulse API", html)
+        self.assertIn("/healthz", html)
 
         status_payload = self.fetch_json("/v1/status")
         self.assertTrue(status_payload["ok"])
         self.assertIn("not short interest", status_payload["disclaimer"].lower())
         self.assertEqual(status_payload["data"]["latest_trade_date"], "2024-04-12")
         self.assertEqual(status_payload["data"]["latest_row_count"], 5)
+        self.assertEqual(
+            status_payload["data"]["cache"]["refresh_policy"]["recent_ingest_window_days"],
+            7,
+        )
+        self.assertEqual(
+            status_payload["data"]["cache"]["refresh_policy"]["latest_probe_ttl_seconds"],
+            900,
+        )
 
         latest_payload = self.fetch_json("/v1/ticker/GME/latest")
         self.assertEqual(latest_payload["data"]["symbol"], "GME")
@@ -152,8 +192,14 @@ class ProbeBehaviorTest(unittest.TestCase):
         self.service = ShortPulseService(
             db_path=Path(self.tmpdir.name) / "shortpulse.sqlite",
             today=date(2024, 4, 14),
+            latest_probe_ttl_seconds=3600,
         )
+        self.app = ShortPulseApplication(self.service)
+        self.requested_urls: list[str] = []
         self.fixture_text = (FIXTURE_DIR / "CNMSshvol20240412.txt").read_text(
+            encoding="utf-8"
+        )
+        self.fixture_text_11 = (FIXTURE_DIR / "CNMSshvol20240411.txt").read_text(
             encoding="utf-8"
         )
 
@@ -162,20 +208,100 @@ class ProbeBehaviorTest(unittest.TestCase):
 
     def fake_urlopen(self, request: urllib.request.Request, timeout: int = 20) -> FakeResponse:
         url = request.full_url
+        self.requested_urls.append(url)
         if url.endswith("20240414.txt") or url.endswith("20240413.txt"):
             raise urllib.error.HTTPError(url, 403, "Forbidden", hdrs=None, fp=None)
         if url.endswith("20240412.txt"):
             return FakeResponse(self.fixture_text)
+        if url.endswith("20240411.txt"):
+            return FakeResponse(self.fixture_text_11)
         raise AssertionError(f"Unexpected URL requested in probe test: {url}")
 
-    def test_latest_probe_treats_403_as_missing(self) -> None:
+    def test_latest_probe_cache_reused_for_recent_scan(self) -> None:
         with patch("urllib.request.urlopen", side_effect=self.fake_urlopen):
             self.assertEqual(self.service.latest_available_trade_date(), "2024-04-12")
+            self.assertEqual(
+                self.service.ensure_recent_trade_dates(2),
+                ["2024-04-12", "2024-04-11"],
+            )
+            self.assertEqual(self.service.latest_available_trade_date(), "2024-04-12")
 
-    def test_explicit_date_still_surfaces_403(self) -> None:
+        self.assertEqual(
+            [url[-12:] for url in self.requested_urls],
+            [
+                "20240414.txt",
+                "20240413.txt",
+                "20240412.txt",
+                "20240411.txt",
+            ],
+        )
+
+    def test_explicit_date_not_found_returns_404(self) -> None:
         with patch("urllib.request.urlopen", side_effect=self.fake_urlopen):
-            with self.assertRaises(UpstreamError):
-                self.service.require_trade_date("2024-04-13")
+            status, content_type, body, _ = self.app.handle(
+                "GET",
+                "/v1/rankings?date=2024-04-13&limit=1",
+            )
+
+        self.assertEqual(status, 404)
+        self.assertIn("application/json", content_type)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "No FINRA file found for 2024-04-13.")
+
+
+class RefreshPolicyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.clock = MutableClock(datetime(2024, 4, 13, 12, 0, tzinfo=UTC))
+        self.service = ShortPulseService(
+            db_path=Path(self.tmpdir.name) / "shortpulse.sqlite",
+            today=date(2024, 4, 13),
+            recent_ingest_ttl_seconds=3600,
+            recent_ingest_window_days=2,
+            latest_probe_ttl_seconds=3600,
+            clock=self.clock,
+        )
+        self.requested_urls: list[str] = []
+        self.fixture_text_12 = (FIXTURE_DIR / "CNMSshvol20240412.txt").read_text(
+            encoding="utf-8"
+        )
+        self.fixture_text_10 = (FIXTURE_DIR / "CNMSshvol20240410.txt").read_text(
+            encoding="utf-8"
+        )
+
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
+    def fake_urlopen(self, request: urllib.request.Request, timeout: int = 20) -> FakeResponse:
+        url = request.full_url
+        self.requested_urls.append(url)
+        if url.endswith("20240412.txt"):
+            return FakeResponse(self.fixture_text_12)
+        if url.endswith("20240410.txt"):
+            return FakeResponse(self.fixture_text_10)
+        raise AssertionError(f"Unexpected URL requested in refresh test: {url}")
+
+    def test_recent_ingests_refresh_after_ttl_while_older_dates_stay_cached(self) -> None:
+        with patch("urllib.request.urlopen", side_effect=self.fake_urlopen):
+            self.service.ingest_trade_date(date(2024, 4, 12))
+            self.clock.advance(seconds=1800)
+            self.service.ingest_trade_date(date(2024, 4, 12))
+            self.clock.advance(seconds=5400)
+            self.service.ingest_trade_date(date(2024, 4, 12))
+
+            self.service.ingest_trade_date(date(2024, 4, 10))
+            self.clock.advance(seconds=7200)
+            self.service.ingest_trade_date(date(2024, 4, 10))
+
+        self.assertEqual(
+            [url[-12:] for url in self.requested_urls].count("20240412.txt"),
+            2,
+        )
+        self.assertEqual(
+            [url[-12:] for url in self.requested_urls].count("20240410.txt"),
+            1,
+        )
 
 
 class SymbolHandlingTest(unittest.TestCase):
@@ -231,6 +357,7 @@ class SymbolHandlingTest(unittest.TestCase):
         self.assertEqual(rows[1]["short_ratio"], 0.5)
 
     def test_ticker_endpoint_decodes_url_encoded_symbol_segments(self) -> None:
+        self.service.ensure_recent_trade_dates(5)
         with self.service._connect() as conn:
             conn.execute(
                 """
@@ -268,6 +395,22 @@ class SymbolHandlingTest(unittest.TestCase):
         payload = json.loads(body.decode("utf-8"))
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["data"]["symbol"], "BRK/B")
+
+
+class ErrorHandlingTest(unittest.TestCase):
+    def test_internal_errors_are_sanitized(self) -> None:
+        class ExplodingService:
+            def status(self) -> dict:
+                raise RuntimeError("leaked details")
+
+        app = ShortPulseApplication(ExplodingService())  # type: ignore[arg-type]
+        status, content_type, body, _ = app.handle("GET", "/v1/status")
+
+        self.assertEqual(status, 500)
+        self.assertIn("application/json", content_type)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(payload["error"], "Internal server error.")
+        self.assertNotIn("leaked details", body.decode("utf-8"))
 
 
 if __name__ == "__main__":

@@ -2,7 +2,8 @@ services:
   - type: web
     name: shortpulse-api
     env: python
-    buildCommand: python3 -m py_compile app.py shortpulse.py smoke_test.py
+    buildCommand: python3 -m compileall . && python3 smoke_test.py
+    healthCheckPath: /healthz
     startCommand: python3 app.py
     envVars:
       - key: SHORTPULSE_DB_PATH

@@ -13,15 +13,16 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 FINRA_URL_TEMPLATE = "https://cdn.finra.org/equity/regsho/daily/CNMSshvol{yyyymmdd}.txt"
 USER_AGENT = (
     "Mozilla/5.0 (compatible; ShortPulseAPI/1.0; +https://shortpulse.local)"
 )
+DISCLAIMER = "ShortPulse API exposes FINRA short-sale volume, not short interest."
 CAVEATS = [
-    "This API reports FINRA daily short-sale volume, not short interest.",
+    DISCLAIMER,
     "v1 only covers the FINRA Consolidated NMS daily file.",
     "FINRA-reported activity is not a complete exchange-consolidated picture.",
     "FINRA files may be revised after publication.",
@@ -29,6 +30,9 @@ CAVEATS = [
 ]
 TRAILER_SYMBOLS = {"NMS", "NMSCOMPOSITE", "TOTAL"}
 FIXTURE_PATTERN = re.compile(r"CNMSshvol(\d{8})\.txt$")
+DEFAULT_RECENT_INGEST_TTL_SECONDS = 6 * 60 * 60
+DEFAULT_RECENT_INGEST_WINDOW_DAYS = 7
+DEFAULT_LATEST_PROBE_TTL_SECONDS = 15 * 60
 
 
 class ShortPulseError(Exception):
@@ -47,8 +51,12 @@ class UpstreamError(ShortPulseError):
     pass
 
 
+def utc_now_datetime() -> datetime:
+    return datetime.now(UTC).replace(microsecond=0)
+
+
 def utc_now() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return utc_now_datetime().isoformat().replace("+00:00", "Z")
 
 
 def iso_date(value: date) -> str:
@@ -67,6 +75,13 @@ def parse_finra_date(value: str) -> date:
         return datetime.strptime(value, "%Y%m%d").date()
     except ValueError as exc:
         raise BadRequestError("Unexpected FINRA trade date format.") from exc
+
+
+def parse_utc_timestamp(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    except ValueError as exc:
+        raise BadRequestError("Unexpected timestamp format.") from exc
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -108,11 +123,19 @@ class ShortPulseService:
         db_path: str | os.PathLike[str],
         fixture_dir: str | os.PathLike[str] | None = None,
         today: date | None = None,
+        recent_ingest_ttl_seconds: int = DEFAULT_RECENT_INGEST_TTL_SECONDS,
+        recent_ingest_window_days: int = DEFAULT_RECENT_INGEST_WINDOW_DAYS,
+        latest_probe_ttl_seconds: int = DEFAULT_LATEST_PROBE_TTL_SECONDS,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.fixture_dir = Path(fixture_dir) if fixture_dir else None
         self._today = today
+        self.recent_ingest_ttl_seconds = max(0, recent_ingest_ttl_seconds)
+        self.recent_ingest_window_days = max(0, recent_ingest_window_days)
+        self.latest_probe_ttl_seconds = max(0, latest_probe_ttl_seconds)
+        self._clock = clock or utc_now_datetime
         self._init_db()
 
     def _init_db(self) -> None:
@@ -145,6 +168,12 @@ class ShortPulseService:
                     row_count INTEGER NOT NULL,
                     fetched_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS latest_trade_date_probe (
+                    probe_key INTEGER PRIMARY KEY CHECK (probe_key = 1),
+                    trade_date TEXT NOT NULL,
+                    checked_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -154,7 +183,16 @@ class ShortPulseService:
         return conn
 
     def today(self) -> date:
-        return self._today or date.today()
+        return self._today or self.now().date()
+
+    def now(self) -> datetime:
+        current = self._clock()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        return current.astimezone(UTC).replace(microsecond=0)
+
+    def now_iso(self) -> str:
+        return self.now().isoformat().replace("+00:00", "Z")
 
     def source_url_for_date(self, trade_date: date) -> str:
         return FINRA_URL_TEMPLATE.format(yyyymmdd=trade_date.strftime("%Y%m%d"))
@@ -229,7 +267,7 @@ class ShortPulseService:
             raise UpstreamError(f"Unexpected FINRA header in {source_url}.") from exc
 
         parsed: list[dict] = []
-        ingested_at = utc_now()
+        ingested_at = self.now_iso()
         for row in rows[1:]:
             if not row or all(not cell.strip() for cell in row):
                 continue
@@ -283,26 +321,84 @@ class ShortPulseService:
                 (trade_date,),
             ).fetchone()
 
+    def get_latest_trade_date_probe(self) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT trade_date, checked_at
+                FROM latest_trade_date_probe
+                WHERE probe_key = 1
+                """
+            ).fetchone()
+
+    def set_latest_trade_date_probe(
+        self, trade_date: str, checked_at: str | None = None
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO latest_trade_date_probe (
+                    probe_key,
+                    trade_date,
+                    checked_at
+                ) VALUES (1, ?, ?)
+                """,
+                (trade_date, checked_at or self.now_iso()),
+            )
+
+    def latest_cached_ingest(self) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT trade_date, source_url, source_mode, row_count, fetched_at
+                FROM ingest_runs
+                ORDER BY trade_date DESC
+                LIMIT 1
+                """
+            ).fetchone()
+
+    def cache_expired(self, fetched_at: str, ttl_seconds: int) -> bool:
+        if ttl_seconds <= 0:
+            return True
+        age = self.now() - parse_utc_timestamp(fetched_at)
+        return age.total_seconds() >= ttl_seconds
+
+    def should_refresh_ingest(self, trade_date: date, cached: sqlite3.Row) -> bool:
+        age_days = (self.today() - trade_date).days
+        if age_days > self.recent_ingest_window_days:
+            return False
+        return self.cache_expired(cached["fetched_at"], self.recent_ingest_ttl_seconds)
+
+    def should_refresh_latest_probe(self, cached: sqlite3.Row) -> bool:
+        return self.cache_expired(cached["checked_at"], self.latest_probe_ttl_seconds)
+
     def ingest_trade_date(
         self, trade_date: date, treat_403_as_missing: bool = False
     ) -> dict | None:
         trade_date_iso = iso_date(trade_date)
         cached = self.get_cached_ingest(trade_date_iso)
-        if cached:
+        if cached and not self.should_refresh_ingest(trade_date, cached):
             return dict(cached)
 
         fetched = self.fetch_raw_text(
             trade_date, treat_403_as_missing=treat_403_as_missing
         )
         if not fetched:
-            return None
+            return dict(cached) if cached else None
         source_url, raw_text, source_mode = fetched
         parsed_rows = self.parse_rows(raw_text, source_url)
         if not parsed_rows:
-            return None
+            return dict(cached) if cached else None
 
-        fetched_at = utc_now()
+        fetched_at = self.now_iso()
         with self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM daily_short_volume
+                WHERE trade_date = ?
+                """,
+                (trade_date_iso,),
+            )
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO daily_short_volume (
@@ -351,13 +447,17 @@ class ShortPulseService:
                 ),
             )
 
-        return {
+        payload = {
             "trade_date": trade_date_iso,
             "source_url": source_url,
             "source_mode": source_mode,
             "row_count": len(parsed_rows),
             "fetched_at": fetched_at,
         }
+        latest_probe = self.get_latest_trade_date_probe()
+        if not latest_probe or trade_date_iso >= latest_probe["trade_date"]:
+            self.set_latest_trade_date_probe(trade_date_iso, checked_at=fetched_at)
+        return payload
 
     def ensure_recent_trade_dates(
         self, count: int, end_date: str | None = None, max_probe_days: int | None = None
@@ -376,7 +476,7 @@ class ShortPulseService:
         if end_date:
             anchor = parse_iso_date(end_date)
         else:
-            anchor = self.today()
+            anchor = parse_iso_date(self.latest_available_trade_date())
         probe_days = max_probe_days or max(30, count * 4)
         found: list[str] = []
         for offset in range(probe_days):
@@ -391,15 +491,42 @@ class ShortPulseService:
         return found
 
     def latest_available_trade_date(self) -> str:
-        dates = self.ensure_recent_trade_dates(1)
-        if not dates:
-            raise NotFoundError("No FINRA daily short-sale volume file is available yet.")
-        return dates[0]
+        cached_probe = self.get_latest_trade_date_probe()
+        if cached_probe and not self.should_refresh_latest_probe(cached_probe):
+            return cached_probe["trade_date"]
+
+        if self.fixture_dir:
+            dates = self.ensure_recent_trade_dates(1)
+            if not dates:
+                raise NotFoundError("No FINRA daily short-sale volume file is available yet.")
+            self.set_latest_trade_date_probe(dates[0])
+            return dates[0]
+
+        latest_cached = self.latest_cached_ingest()
+        probe_days = 30
+        if latest_cached:
+            probe_days = max(
+                probe_days,
+                (self.today() - parse_iso_date(latest_cached["trade_date"])).days + 1,
+            )
+
+        for offset in range(probe_days):
+            candidate = self.today() - timedelta(days=offset)
+            ingested = self.ingest_trade_date(candidate, treat_403_as_missing=True)
+            if ingested:
+                trade_date_iso = ingested["trade_date"]
+                self.set_latest_trade_date_probe(trade_date_iso)
+                return trade_date_iso
+
+        raise NotFoundError("No FINRA daily short-sale volume file is available yet.")
 
     def require_trade_date(self, requested_date: str | None = None) -> str:
         if requested_date:
             trade_date = iso_date(parse_iso_date(requested_date))
-            ingested = self.ingest_trade_date(parse_iso_date(requested_date))
+            ingested = self.ingest_trade_date(
+                parse_iso_date(requested_date),
+                treat_403_as_missing=True,
+            )
             if not ingested:
                 raise NotFoundError(f"No FINRA file found for {trade_date}.")
             return trade_date
@@ -414,6 +541,7 @@ class ShortPulseService:
 
     def status(self) -> dict:
         latest_trade_date = self.latest_available_trade_date()
+        latest_probe = self.get_latest_trade_date_probe()
         with self._connect() as conn:
             summary = conn.execute(
                 """
@@ -425,6 +553,7 @@ class ShortPulseService:
                 """
                 SELECT trade_date, source_url, source_mode, row_count, fetched_at
                 FROM ingest_runs
+                WHERE row_count > 0
                 ORDER BY trade_date DESC
                 LIMIT 1
                 """
@@ -433,6 +562,7 @@ class ShortPulseService:
                 """
                 SELECT source_url
                 FROM ingest_runs
+                WHERE row_count > 0
                 ORDER BY trade_date DESC
                 LIMIT 5
                 """
@@ -451,6 +581,16 @@ class ShortPulseService:
                 "cached_rows": summary["total_rows"],
                 "latest_source_mode": latest_ingest["source_mode"] if latest_ingest else None,
                 "last_ingested_at": latest_ingest["fetched_at"] if latest_ingest else None,
+                "latest_trade_date_probe": {
+                    "trade_date": latest_probe["trade_date"] if latest_probe else None,
+                    "checked_at": latest_probe["checked_at"] if latest_probe else None,
+                    "ttl_seconds": self.latest_probe_ttl_seconds,
+                },
+                "refresh_policy": {
+                    "recent_ingest_window_days": self.recent_ingest_window_days,
+                    "recent_ingest_ttl_seconds": self.recent_ingest_ttl_seconds,
+                    "latest_probe_ttl_seconds": self.latest_probe_ttl_seconds,
+                },
                 "freshness": freshness,
                 "calendar_days_behind": lag_days,
             },

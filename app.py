@@ -8,7 +8,11 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from shortpulse import (
     CAVEATS,
+    DISCLAIMER,
     BadRequestError,
+    DEFAULT_LATEST_PROBE_TTL_SECONDS,
+    DEFAULT_RECENT_INGEST_TTL_SECONDS,
+    DEFAULT_RECENT_INGEST_WINDOW_DAYS,
     NotFoundError,
     ShortPulseService,
     UpstreamError,
@@ -16,9 +20,6 @@ from shortpulse import (
     parse_iso_date,
     utc_now,
 )
-
-
-DISCLAIMER = "ShortPulse API exposes FINRA short-sale volume, not short interest."
 
 
 def int_arg(query: dict[str, list[str]], name: str, default: int) -> int:
@@ -36,8 +37,22 @@ def str_arg(query: dict[str, list[str]], name: str, default: str | None = None) 
     return values[0]
 
 
+def env_int(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value in {None, ""}:
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer.") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be non-negative.")
+    return parsed
+
+
 def landing_page() -> str:
     endpoint_rows = [
+        ("GET", "/healthz", "Lightweight health check for deploy platforms and smoke tests."),
         ("GET", "/v1/status", "Latest ingested trade date, cache freshness, and source URLs."),
         ("GET", "/v1/ticker/{symbol}/latest", "Most recent cached short-sale volume snapshot for one ticker."),
         ("GET", "/v1/ticker/{symbol}/history?days=20", "Recent history for a ticker, returned oldest to newest."),
@@ -317,6 +332,16 @@ class ShortPulseApplication:
             {"Access-Control-Allow-Origin": "*"},
         )
 
+    def text_response(
+        self, status: HTTPStatus, text: str
+    ) -> tuple[HTTPStatus, str, bytes, dict[str, str]]:
+        return (
+            status,
+            "text/plain; charset=utf-8",
+            text.encode("utf-8"),
+            {"Access-Control-Allow-Origin": "*"},
+        )
+
     def empty_response(self, status: HTTPStatus) -> tuple[HTTPStatus, str, bytes, dict[str, str]]:
         return (
             status,
@@ -351,10 +376,10 @@ class ShortPulseApplication:
             return self.json_response(HTTPStatus.NOT_FOUND, error=str(exc))
         except UpstreamError as exc:
             return self.json_response(HTTPStatus.BAD_GATEWAY, error=str(exc))
-        except Exception as exc:  # pragma: no cover - last-resort guardrail
+        except Exception:  # pragma: no cover - last-resort guardrail
             return self.json_response(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                error=f"Internal error: {exc}",
+                error="Internal server error.",
             )
 
     def handle_get(self, raw_path: str) -> tuple[HTTPStatus, str, bytes, dict[str, str]]:
@@ -364,6 +389,8 @@ class ShortPulseApplication:
 
         if path == "/":
             return self.html_response(HTTPStatus.OK, landing_page())
+        if path == "/healthz":
+            return self.text_response(HTTPStatus.OK, "ok\n")
         if path == "/v1/status":
             return self.json_response(HTTPStatus.OK, self.service.status())
         if path.startswith("/v1/ticker/") and path.endswith("/latest"):
@@ -468,7 +495,26 @@ def build_service_from_env() -> ShortPulseService:
     fixture_dir = os.environ.get("SHORTPULSE_FIXTURE_DIR")
     today_value = os.environ.get("SHORTPULSE_TODAY")
     today = parse_iso_date(today_value) if today_value else None
-    return ShortPulseService(db_path=db_path, fixture_dir=fixture_dir, today=today)
+    recent_ingest_ttl_seconds = env_int(
+        "SHORTPULSE_RECENT_INGEST_TTL_SECONDS",
+        DEFAULT_RECENT_INGEST_TTL_SECONDS,
+    )
+    recent_ingest_window_days = env_int(
+        "SHORTPULSE_RECENT_INGEST_WINDOW_DAYS",
+        DEFAULT_RECENT_INGEST_WINDOW_DAYS,
+    )
+    latest_probe_ttl_seconds = env_int(
+        "SHORTPULSE_LATEST_PROBE_TTL_SECONDS",
+        DEFAULT_LATEST_PROBE_TTL_SECONDS,
+    )
+    return ShortPulseService(
+        db_path=db_path,
+        fixture_dir=fixture_dir,
+        today=today,
+        recent_ingest_ttl_seconds=recent_ingest_ttl_seconds,
+        recent_ingest_window_days=recent_ingest_window_days,
+        latest_probe_ttl_seconds=latest_probe_ttl_seconds,
+    )
 
 
 def create_server(

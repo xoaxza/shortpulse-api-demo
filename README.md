@@ -13,6 +13,7 @@ Important caveats:
 ## What It Exposes
 
 - `GET /` HTML landing page and docs
+- `GET /healthz`
 - `GET /v1/status`
 - `GET /v1/ticker/{symbol}/latest`
 - `GET /v1/ticker/{symbol}/history?days=20`
@@ -32,6 +33,9 @@ The service binds to `0.0.0.0` and reads `PORT` from the environment. Defaults:
 
 - `PORT=8000`
 - `SHORTPULSE_DB_PATH=data/shortpulse.sqlite`
+- `SHORTPULSE_RECENT_INGEST_WINDOW_DAYS=7`
+- `SHORTPULSE_RECENT_INGEST_TTL_SECONDS=21600`
+- `SHORTPULSE_LATEST_PROBE_TTL_SECONDS=900`
 
 Example:
 
@@ -40,6 +44,8 @@ PORT=8000 python3 app.py
 ```
 
 Open `http://127.0.0.1:8000/`.
+
+Health checks can use `http://127.0.0.1:8000/healthz`.
 
 ## Fixture Mode
 
@@ -107,6 +113,7 @@ Notes:
 
 - The local SQLite cache is fine for a tiny single-instance deployment.
 - On Render free or ephemeral disks, cache contents may reset on redeploy or restart.
+- Latest-trade-date probes are cached briefly, and recent cached ingests can be refreshed after a TTL.
 - x402-ready paid access can be added later, but it is not live today.
 
 ## Implementation Notes
