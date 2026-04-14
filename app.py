@@ -240,7 +240,7 @@ def landing_page() -> str:
             <h2>Roadmap</h2>
             <ul>
               <li>x402-ready paid access can come later</li>
-              <li>Not live today</li>
+              <li>Live demo today</li>
               <li>v1 stays intentionally narrow and caveat-heavy</li>
             </ul>
           </div>
